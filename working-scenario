@@ -11,6 +11,7 @@ var URL_PROMPT   = "https://github.com/rbarahona-vox/ICCCapitalAudios/raw/refs/h
 var URL_INVALID  = "https://github.com/rbarahona-vox/ICCCapitalAudios/raw/refs/heads/main/Opcion%20no%20valida.mp3"; 
 var URL_GOODBYE  = "https://github.com/rbarahona-vox/ICCCapitalAudios/raw/refs/heads/main/Finalizacion%20llamada.mp3";
 var URL_TIMEOUT  = "https://github.com/rbarahona-vox/ICCCapitalAudios/raw/refs/heads/main/sin%20respuesta.mp3"; 
+var URL_NO_AGENTS = "https://github.com/rbarahona-vox/ICCCapitalAudios/raw/refs/heads/main/no_hay_agentes.mp3";
 
 var DTMF_TIMEOUT_MS = 8000;
 var kitCall = null;
@@ -84,6 +85,20 @@ function fetchContactByPhone(phone, campId, callback) {
       callback(data.result && data.result[0] ? data.result[0] : null);
     } catch (err) { callback(null); }
   }, { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, postData: body });
+}
+
+function checkAgentAvailability(callback) {
+  var url = KIT_API_BASE + "/agentCampaigns/getStatistics?domain=" + KIT_DOMAIN + "&access_token=" + KIT_API_TOKEN + "&campaign_id=" + campaignId;
+  Net.httpRequest(url, function(res) {
+    if (res.code === 200) {
+      try {
+        var stats = JSON.parse(res.text);
+        var readyAgents = stats.result.agents_by_status.READY || 0;
+        log("Agentes en estado READY: " + readyAgents);
+        callback(readyAgents > 0);
+      } catch (e) { callback(true); }
+    } else { callback(true); }
+  });
 }
 
 VoxEngine.addEventListener(AppEvents.CallAlerting, function(e) {
@@ -172,8 +187,15 @@ function onDTMFGlobal(e) {
   if (dtmfTimer !== null) { clearTimeout(dtmfTimer); dtmfTimer = null; }
   if (e.tone === "1") {
     dtmfActive = false;
-    if (isHuman) connectClientToKit();
-    else terminateAll();
+    if (isHuman) {
+      checkAgentAvailability(function(hasAgents) {
+        if (hasAgents) connectClientToKit();
+        else {
+          log("Campaña sin agentes READY. Reproduciendo audio de cierre.");
+          playMp3AndThen(URL_NO_AGENTS, terminateAll);
+        }
+      });
+    } else terminateAll();
   } else if (e.tone === "2") {
     dtmfActive = false;
     recordCidResult(clientPhone, "no");

@@ -1,0 +1,203 @@
+require(Modules.AI);
+require(Modules.ApplicationStorage);
+
+var pool = ["525512048512", "525513284636"];
+var selectedCID = null;
+var amd = null;
+var amdEnabled = false;
+var isHuman = false;
+
+var URL_PROMPT   = "https://github.com/rbarahona-vox/ICCCapitalAudios/raw/refs/heads/main/Post%20Saludo%20ICCCapital.mp3";
+var URL_INVALID  = "https://github.com/rbarahona-vox/ICCCapitalAudios/raw/refs/heads/main/Opcion%20no%20valida.mp3"; 
+var URL_GOODBYE  = "https://github.com/rbarahona-vox/ICCCapitalAudios/raw/refs/heads/main/Finalizacion%20llamada.mp3";
+var URL_TIMEOUT  = "https://github.com/rbarahona-vox/ICCCapitalAudios/raw/refs/heads/main/sin%20respuesta.mp3"; 
+
+var DTMF_TIMEOUT_MS = 8000;
+var kitCall = null;
+var clientCall = null;
+var clientPhone = "";
+var campaignId = "";
+var dtmfTimer = null;
+var dtmfActive = false;
+var bridged = false;
+var currentMp3Player = null;
+
+var KIT_API_BASE = "https://kitapi-us.voximplant.com/api/v3";
+var KIT_API_TOKEN = "7d94ca7c02cfb687947671621f5464ed73e0b2b2dfa36e84756ac45393bd4bb4";
+var KIT_DOMAIN = "icccapital";
+var contactName = "";
+
+function log(msg) { Logger.write("[IVR-PDS] " + msg); }
+
+function normalizeNumber(num) { return num.length === 10 ? "57" + num : num; }
+
+function recordCidResult(phone, result) {
+  var key = normalizeNumber(phone);
+  var payload = { cid: selectedCID, result: result };
+  try { ApplicationStorage.put(key, JSON.stringify(payload)); } catch (err) { log("Error guardando CID: " + err); }
+}
+
+async function selectCallerId(phone, callback) {
+  var key = normalizeNumber(phone);
+  var history = null;
+  try {
+    const stored = await ApplicationStorage.get(key);
+    if (stored && stored.value) history = JSON.parse(stored.value.toString());
+  } catch (err) { log("Sin historial previo."); }
+  selectedCID = (!history || history.result !== "yes") ? pool[Math.floor(Math.random() * pool.length)] : history.cid;
+  callback();
+}
+
+function stopCurrentAudio() {
+  if (currentMp3Player) {
+    try { currentMp3Player.stop(); } catch(e) {}
+    currentMp3Player = null;
+  }
+}
+
+function playMp3AndThen(url, callback) {
+  stopCurrentAudio();
+  currentMp3Player = VoxEngine.createURLPlayer(url);
+  currentMp3Player.sendMediaTo(clientCall);
+  currentMp3Player.addEventListener(PlayerEvents.PlaybackFinished, function onPF() {
+    stopCurrentAudio();
+    if (callback) callback();
+  });
+}
+
+function terminateAll() {
+  dtmfActive = false;
+  if (dtmfTimer !== null) { clearTimeout(dtmfTimer); dtmfTimer = null; }
+  stopCurrentAudio();
+  if (clientCall && clientCall.state() !== "disconnected") clientCall.hangup();
+  if (kitCall && kitCall.state() !== "disconnected") kitCall.hangup();
+  VoxEngine.terminate();
+}
+
+function fetchContactByPhone(phone, campId, callback) {
+  var url = KIT_API_BASE + "/agentCampaigns/searchContacts?domain=" + KIT_DOMAIN;
+  var body = "access_token=" + encodeURIComponent(KIT_API_TOKEN) + "&campaign_id=" + encodeURIComponent(campId) + "&phone=" + encodeURIComponent(phone);
+  Net.httpRequest(url, function(res) {
+    if (res.code !== 200) { callback(null); return; }
+    try {
+      var data = JSON.parse(res.text);
+      callback(data.result && data.result[0] ? data.result[0] : null);
+    } catch (err) { callback(null); }
+  }, { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, postData: body });
+}
+
+VoxEngine.addEventListener(AppEvents.CallAlerting, function(e) {
+  kitCall = e.call;
+  clientPhone = e.destination;
+  campaignId = (e.headers || {})["X-Kit-Pds"] || "";
+  kitCall.addEventListener(CallEvents.Disconnected, terminateAll);
+  
+  fetchContactByPhone(clientPhone, campaignId, function(contact) {
+    if (contact) contactName = (contact.custom_data.name || "").trim();
+    amd = AMD.create({ model: AMD.Model.MX, timeout: 6500 });
+    amdEnabled = true;
+
+    amd.addEventListener(AMD.Events.DetectionComplete, function(result) {
+      if (result.resultClass === AMD.ResultClass.HUMAN || result.resultClass === AMD.ResultClass.OTHER) {
+        log("AMD: HUMANO detectado");
+        isHuman = true;
+        playIVR();
+      } else {
+        if (kitCall) kitCall.reject(486);
+        recordCidResult(clientPhone, "no");
+        terminateAll();
+      }
+    });
+
+    selectCallerId(clientPhone, function() {
+      clientCall = VoxEngine.callPSTN(clientPhone, selectedCID, { amd: amd });
+      clientCall.handleTones(true);
+      clientCall.addEventListener(CallEvents.ToneReceived, onDTMFGlobal);
+      clientCall.addEventListener(CallEvents.Connected, onClientConnected);
+      clientCall.addEventListener(CallEvents.Disconnected, onClientDisconnected);
+      clientCall.addEventListener(CallEvents.Failed, onClientFailed);
+    });
+  });
+});
+
+function onClientConnected() { if (!amdEnabled) playIVR(); }
+
+async function playIVR() {
+  if (!clientCall) return;
+  clientCall.record();
+  dtmfActive = true; 
+
+  if (contactName) {
+    stopCurrentAudio();
+    currentMp3Player = VoxEngine.createTTSPlayer("Hola " + contactName + ".", {
+      progressivePlayback: true,
+      language: VoiceList.Microsoft.Neural.es_MX_DaliaNeural
+    });
+    currentMp3Player.sendMediaTo(clientCall);
+    currentMp3Player.addEventListener(PlayerEvents.PlaybackFinished, () => {
+      stopCurrentAudio();
+      playLongMp3(URL_PROMPT);
+    });
+  } else {
+    playLongMp3(URL_PROMPT);
+  }
+}
+
+function playLongMp3(url) {
+  stopCurrentAudio();
+  currentMp3Player = VoxEngine.createURLPlayer(url);
+  currentMp3Player.sendMediaTo(clientCall);
+  currentMp3Player.addEventListener(PlayerEvents.PlaybackFinished, () => {
+    stopCurrentAudio();
+    waitForDTMF();
+  });
+}
+
+function waitForDTMF() {
+  dtmfActive = true;
+  if (dtmfTimer !== null) clearTimeout(dtmfTimer);
+  dtmfTimer = setTimeout(function() {
+    dtmfActive = false;
+    log("Timeout DTMF");
+    recordCidResult(clientPhone, "no");
+    playMp3AndThen(URL_TIMEOUT, terminateAll);
+  }, DTMF_TIMEOUT_MS);
+}
+
+function onDTMFGlobal(e) {
+  if (!dtmfActive) return;
+  log("Tono recibido: " + e.tone);
+  stopCurrentAudio(); 
+  try { clientCall.stopPlayback(); } catch(err) {}
+  if (dtmfTimer !== null) { clearTimeout(dtmfTimer); dtmfTimer = null; }
+  if (e.tone === "1") {
+    dtmfActive = false;
+    if (isHuman) connectClientToKit();
+    else terminateAll();
+  } else if (e.tone === "2") {
+    dtmfActive = false;
+    recordCidResult(clientPhone, "no");
+    playMp3AndThen(URL_GOODBYE, function() {
+      if (kitCall && kitCall.state() !== "disconnected") kitCall.reject(603);
+      terminateAll();
+    });
+  } else {
+    log("Opción inválida: " + e.tone);
+    playMp3AndThen(URL_INVALID, function() {
+        waitForDTMF();
+    });
+  }
+}
+
+function connectClientToKit() {
+  if (bridged) return;
+  recordCidResult(clientPhone, "yes");
+  bridged = true;
+  kitCall.addEventListener(CallEvents.Connected, function() {
+    VoxEngine.easyProcess(kitCall, clientCall);
+  });
+  kitCall.answer();
+}
+
+function onClientDisconnected() { recordCidResult(clientPhone, "no"); terminateAll(); }
+function onClientFailed() { recordCidResult(clientPhone, "no"); terminateAll(); }
